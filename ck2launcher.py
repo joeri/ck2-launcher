@@ -18,6 +18,7 @@
 
 import os, sys, glob, re, wx, datetime, ConfigParser
 from subprocess import Popen
+from functools import reduce
 
 APPNAME = 'Crusader Kings II Launcher' 	#: Application name
 VERSION = '0.3.1-28012013'		#: Application version
@@ -116,6 +117,46 @@ def okMsg(text):
   '''
   print('    {0}{1}{2}'.format(OKCOLOR, text, ENDCOLOR))
   log(text)
+
+# Taken from http://code.activestate.com/recipes/577413-topological-sort/
+# or rather http://code.activestate.com/recipes/578272-topological-sort/
+# I don't actually know any python, so any changes are messy
+# Used to sort dependencies
+def toposort2(data):
+  """Dependencies are expressed as a dictionary whose keys are items
+and whose values are a set of dependent items. Output is a list of
+sets in topological order. The first set consists of items with no
+dependences, each subsequent set consists of items that depend upon
+items in the preceeding sets.
+>>> print '\\n'.join(repr(sorted(x)) for x in toposort2({
+...     2: set([11]),
+...     9: set([11,8]),
+...     10: set([11,3]),
+...     11: set([7,5]),
+...     8: set([7,3]),
+...     }) )
+[3, 5, 7]
+[8, 11]
+[2, 9, 10]
+
+"""
+
+  # Ignore self dependencies.
+  for k, v in data.items():
+      v.discard(k)
+  # Find all items that don't depend on anything.
+  extra_items_in_deps = reduce(set.union, data.itervalues()) - set(data.iterkeys())
+  # Add empty dependences where needed
+  data.update({item:set() for item in extra_items_in_deps})
+  while True:
+      ordered = set(item for item, dep in data.iteritems() if not dep)
+      if not ordered:
+          break
+      yield ordered
+      data = {item: (dep - ordered)
+              for item, dep in data.iteritems()
+                  if item not in ordered}
+  assert not data, "Cyclic dependencies exist among these items:\n%s" % '\n'.join(repr(x) for x in data.iteritems())
   
 
 class Mod:
@@ -173,11 +214,17 @@ class Mod:
       self.name = self.filename
       
     # Get mod directory (if available)
-    self.directory = re.search('^user_dir[ \t]*=[ \t]*"(.*)"', moddata, re.MULTILINE)
+    self.directory = re.search('^user_dir[ \t]*=[ \t]*{([ \t]*"(.*)")+[ \t]*}', moddata, re.MULTILINE)
     if (hasattr(self.directory, 'group')):
       self.directory = os.path.dirname(config.get('launcher', 'modpath')) + '/' + self.directory.group(1)
     else:
       self.directory = ''
+
+    self.dependencies = re.search('^dependencies[ \t]*=[ \t]*{([^}]*)}', moddata, re.MULTILINE)
+    if (hasattr(self.dependencies, 'group')):
+      self.dependencies = re.findall('"([^"]+)"', self.dependencies.group(1))
+    else:
+      self.dependencies = None
     
 # END CLASS Mod
 
@@ -455,9 +502,34 @@ class Launcher(wx.Frame):
     else:
       # Append selected mods to command
       okMsg(str(len(selectedMods)) + " mods selected:")
+      # Figure out the dependencies of the mods (if any)
+      # Step 1: force them in the format toposort2 expects (a dictionary where
+      # the key is what the value(s) depend on)
+      # Step 2: apply toposort2
+      # Step 3: get the order back based on the names
+      # BTW: this assumes no duplicate names
+      hashedMods = dict()
       for mod in selectedMods:
-	okMsg('\t{0} ({1})'.format(mod.name, mod.filename))
-	command.append('-mod=mod/' + mod.filename)
+        if mod.dependencies:
+          for dep in mod.dependencies:
+            if dep in hashedMods:
+              hashedMods[dep].add(mod.name)
+            else:
+              hashedMods[dep] = set([mod.name])
+        if mod.name not in hashedMods:
+          hashedMods[mod.name] = set([])
+      sortednames = [item for sublist in toposort2(hashedMods) for item in sublist]
+      sortedMods = []
+      for modName in sortednames:
+        for mod in selectedMods[:]:
+          if mod.name == modName:
+            sortedMods.append(mod)
+            selectedMods.remove(mod)
+            break
+
+      for mod in sortedMods:
+        okMsg('\t{0} ({1})'.format(mod.name, mod.filename))
+        command.append('-mod=mod/' + mod.filename)
 	
     # Exclude unchecked DLC's
     for index in range(0, len(self.dlcs)):
